@@ -1,4 +1,6 @@
 /******************************************************************************
+ * Copyright (c) 2013, The Linux Foundation. All rights reserved.
+ * Not a Contribution.
  *
  *  Copyright (C) 2009-2012 Broadcom Corporation
  *
@@ -55,6 +57,10 @@
 #include <cutils/log.h>
 #include <hardware/bluetooth.h>
 #define asrt(s) if(!(s)) APPL_TRACE_ERROR3("## %s assert %s failed at line:%d ##",__FUNCTION__, #s, __LINE__)
+
+#define UUID_MAX_LENGTH 16
+
+#define IS_UUID(u1,u2)  !memcmp(u1,u2,UUID_MAX_LENGTH)
 
 extern void uuid_to_string(bt_uuid_t *p_uuid, char *str);
 static inline void logu(const char* title, const uint8_t * p_uuid)
@@ -247,9 +253,15 @@ static rfc_slot_t* alloc_rfc_slot(const bt_bdaddr_t *addr, const char* name, con
     int security = 0;
     if(flags & BTSOCK_FLAG_ENCRYPT)
         security |= server ? BTM_SEC_IN_ENCRYPT : BTM_SEC_OUT_ENCRYPT;
-    if(flags & BTSOCK_FLAG_AUTH)
-        security |= server ? BTM_SEC_IN_AUTHENTICATE : BTM_SEC_OUT_AUTHENTICATE;
-
+    if(flags & BTSOCK_FLAG_AUTH) {
+        /* Convert SAP Authentication to High Authentication */
+        if(IS_UUID(UUID_SAP, uuid)) {
+            security |= BTM_SEC_IN_AUTH_HIGH;
+        }
+        else {
+            security |= server ? BTM_SEC_IN_AUTHENTICATE : BTM_SEC_OUT_AUTHENTICATE;
+        }
+    }
     rfc_slot_t* rs = find_free_slot();
     if(rs)
     {
@@ -291,17 +303,20 @@ static inline rfc_slot_t* create_srv_accept_rfc_slot(rfc_slot_t* srv_rs, const b
     accept_rs->role = srv_rs->role;
     accept_rs->rfc_handle = open_handle;
     accept_rs->rfc_port_handle = BTA_JvRfcommGetPortHdl(open_handle);
-    asrt(accept_rs->rfc_handle == srv_rs->rfc_handle);
-    asrt(accept_rs->rfc_port_handle == srv_rs->rfc_port_handle);
-    //now update listen handle of server slot
+     //now update listen rfc_handle of server slot
     srv_rs->rfc_handle = new_listen_handle;
-    srv_rs->rfc_port_handle =  BTA_JvRfcommGetPortHdl(new_listen_handle);
-    //now swap the slot id
+    srv_rs->rfc_port_handle = BTA_JvRfcommGetPortHdl(new_listen_handle);
+    BTIF_TRACE_DEBUG4("create_srv_accept__rfc_slot(open_handle: 0x%x, new_listen_handle:"
+            "0x%x) accept_rs->rfc_handle:0x%x, srv_rs_listen->rfc_handle:0x%x"
+      ,open_handle, new_listen_handle, accept_rs->rfc_port_handle, srv_rs->rfc_port_handle);
+    asrt(accept_rs->rfc_port_handle != srv_rs->rfc_port_handle);
+  //now swap the slot id
     uint32_t new_listen_id = accept_rs->id;
     accept_rs->id = srv_rs->id;
     srv_rs->id = new_listen_id;
     return accept_rs;
 }
+
 bt_status_t btsock_rfc_listen(const char* service_name, const uint8_t* service_uuid, int channel,
                             int* sock_fd, int flags)
 {
@@ -315,15 +330,31 @@ bt_status_t btsock_rfc_listen(const char* service_name, const uint8_t* service_u
     *sock_fd = -1;
     if(!is_init_done())
         return BT_STATUS_NOT_READY;
-    if(is_uuid_empty(service_uuid))
+    if(channel == RESERVED_SCN_FTP)
+    {
+        service_uuid = UUID_FTP;
+    }
+    else if(is_uuid_empty(service_uuid))
         service_uuid = UUID_SPP; //use serial port profile to listen to specified channel
     else
     {
-        //Check the service_uuid. overwrite the channel # if reserved
-        int reserved_channel = get_reserved_rfc_channel(service_uuid);
-        if(reserved_channel > 0)
-        {
-            channel = reserved_channel;
+        APPL_TRACE_DEBUG1("service name to register: %s", service_name);
+        if (!strncmp(service_name, "SMS/MMS Message Access", strlen("SMS/MMS Message Access"))) {
+            channel = RESERVED_SCN_MAS0;
+            APPL_TRACE_DEBUG1("Registering MAP SDP for: %s", service_name);
+        } else if (!strncmp(service_name, "Email Message Access", strlen("Email Message Access"))) {
+            channel = RESERVED_SCN_MAS1;
+            APPL_TRACE_DEBUG1("Registering MAP SDP for: %s", service_name);
+        } else if (!strncmp(service_name, "OBEX File Transfer", strlen("OBEX File Transfer"))) {
+            channel = RESERVED_SCN_FTP;
+            APPL_TRACE_DEBUG1("Registering FTP SDP for: %s", service_name);
+        } else {
+            //Check the service_uuid. overwrite the channel # if reserved
+            int reserved_channel = get_reserved_rfc_channel(service_uuid);
+            if(reserved_channel > 0)
+            {
+                channel = reserved_channel;
+            }
         }
     }
     int status = BT_STATUS_FAIL;
@@ -341,6 +372,7 @@ bt_status_t btsock_rfc_listen(const char* service_name, const uint8_t* service_u
     unlock_slot(&slot_lock);
     return status;
 }
+
 bt_status_t btsock_rfc_connect(const bt_bdaddr_t *bd_addr, const uint8_t* service_uuid,
         int channel, int* sock_fd, int flags)
 {
@@ -471,7 +503,7 @@ static inline void free_rfc_slot_scn(rfc_slot_t* rs)
     {
         if(rs->f.server && !rs->f.closing && rs->rfc_handle)
         {
-            BTA_JvRfcommStopServer(rs->rfc_handle);
+            BTA_JvRfcommStopServer(rs->rfc_handle, (void*)rs->id);
             rs->rfc_handle = 0;
         }
         if(rs->f.server)
@@ -500,8 +532,8 @@ static void cleanup_rfc_slot(rfc_slot_t* rs)
     }
     if(rs->rfc_handle && !rs->f.closing && !rs->f.server)
     {
-        APPL_TRACE_DEBUG1("closing rfcomm connection, rfc_handle:%d", rs->rfc_handle);
-        BTA_JvRfcommClose(rs->rfc_handle);
+        APPL_TRACE_DEBUG1("closing rfcomm connection, rfc_handle:0x%x", rs->rfc_handle);
+        BTA_JvRfcommClose(rs->rfc_handle, (void*)rs->id);
         rs->rfc_handle = 0;
     }
     free_rfc_slot_scn(rs);
@@ -643,8 +675,7 @@ static void on_rfc_close(tBTA_JV_RFCOMM_CLOSE * p_close, uint32_t id)
         APPL_TRACE_DEBUG4("on_rfc_close, slot id:%d, fd:%d, rfc scn:%d, server:%d",
                          rs->id, rs->fd, rs->scn, rs->f.server);
         free_rfc_slot_scn(rs);
-        //rfc_handle already closed when receiving rfcomm close event from stack.
-        rs->rfc_handle = 0;
+        // rfc_handle already closed when receiving rfcomm close event from stack.
         rs->f.connected = FALSE;
         cleanup_rfc_slot(rs);
     }
@@ -692,9 +723,11 @@ static void *rfcomm_cback(tBTA_JV_EVT event, tBTA_JV *p_data, void *user_data)
         break;
 
     case BTA_JV_RFCOMM_OPEN_EVT:
+        BTA_JvSetPmProfile(p_data->rfc_open.handle,BTA_JV_PM_ID_1,BTA_JV_CONN_OPEN);
         on_cli_rfc_connect(&p_data->rfc_open, (uint32_t)user_data);
         break;
     case BTA_JV_RFCOMM_SRV_OPEN_EVT:
+        BTA_JvSetPmProfile(p_data->rfc_srv_open.handle,BTA_JV_PM_ALL,BTA_JV_CONN_OPEN);
         new_user_data = (void*)on_srv_rfc_connect(&p_data->rfc_srv_open, (uint32_t)user_data);
         break;
 
@@ -881,7 +914,13 @@ void btsock_rfc_signaled(int fd, int flags, uint32_t user_id)
             if(!rs->f.server)
             {
                 if(rs->f.connected)
-                    BTA_JvRfcommWrite(rs->rfc_handle, (UINT32)rs->id);
+                {
+                    int size = 0;
+                    //make sure there's data pending in case the peer closed the socket
+                    if(!(flags & SOCK_THREAD_FD_EXCEPTION) ||
+                                (ioctl(rs->fd, FIONREAD, &size) == 0 && size))
+                        BTA_JvRfcommWrite(rs->rfc_handle, (UINT32)rs->id);
+                }
                 else
                 {
                     APPL_TRACE_ERROR2("SOCK_THREAD_FD_RD signaled when rfc is not connected, \
@@ -903,18 +942,22 @@ void btsock_rfc_signaled(int fd, int flags, uint32_t user_id)
         }
         if(need_close || (flags & SOCK_THREAD_FD_EXCEPTION))
         {
-            APPL_TRACE_DEBUG1("SOCK_THREAD_FD_EXCEPTION, flags:%x", flags);
-            rs->f.closing = TRUE;
-            if(rs->f.server)
-                BTA_JvRfcommStopServer(rs->rfc_handle);
+            int size = 0;
+            if(need_close || ioctl(rs->fd, FIONREAD, &size) != 0 || size == 0 )
+            {
+                //cleanup when no data pending
+                APPL_TRACE_DEBUG3("SOCK_THREAD_FD_EXCEPTION, cleanup, flags:%x, need_close:%d, pending size:%d",
+                                flags, need_close, size);
+                cleanup_rfc_slot(rs);
+            }
             else
-                BTA_JvRfcommClose(rs->rfc_handle);
+                APPL_TRACE_DEBUG3("SOCK_THREAD_FD_EXCEPTION, cleanup pending, flags:%x, need_close:%d, pending size:%d",
+                                flags, need_close, size);
         }
     }
     unlock_slot(&slot_lock);
 }
-//stack rfcomm callout functions
-//[
+
 int bta_co_rfc_data_incoming(void *user_data, BT_HDR *p_buf)
 {
     uint32_t id = (uint32_t)user_data;
@@ -967,6 +1010,7 @@ int bta_co_rfc_data_outgoing_size(void *user_data, int *size)
             cleanup_rfc_slot(rs);
         }
     }
+    else APPL_TRACE_ERROR1("bta_co_rfc_data_outgoing_size, invalid slot id:%d", id);
     unlock_slot(&slot_lock);
     return ret;
 }
@@ -988,8 +1032,8 @@ int bta_co_rfc_data_outgoing(void *user_data, UINT8* buf, UINT16 size)
             cleanup_rfc_slot(rs);
         }
     }
+    else APPL_TRACE_ERROR1("bta_co_rfc_data_outgoing, invalid slot id:%d", id);
     unlock_slot(&slot_lock);
     return ret;
 }
-//]
 

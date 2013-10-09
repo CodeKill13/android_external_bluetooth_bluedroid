@@ -47,6 +47,7 @@
 #include "btif_util.h"
 #include "btif_sock.h"
 #include "btif_pan.h"
+#include "btc_common.h"
 #include "btif_profile_queue.h"
 #include "btif_config.h"
 /************************************************************************************
@@ -130,7 +131,7 @@ extern void bte_load_did_conf(const char *p_path);
 
 /** TODO: Move these to _common.h */
 void bte_main_boot_entry(void);
-void bte_main_enable(uint8_t *local_addr);
+void bte_main_enable();
 void bte_main_disable(void);
 void bte_main_shutdown(void);
 #if (defined(HCILP_INCLUDED) && HCILP_INCLUDED == TRUE)
@@ -290,7 +291,27 @@ static void btif_task(UINT32 params)
         if (event == BT_EVT_TRIGGER_STACK_INIT)
         {
             BTIF_TRACE_DEBUG0("btif_task: received trigger stack init event");
+            #if (BLE_INCLUDED == TRUE)
+            btif_dm_load_ble_local_keys();
+            #endif
             BTA_EnableBluetooth(bte_dm_evt);
+        }
+
+        /*
+         * Failed to initialize controller hardware, reset state and bring
+         * down all threads
+         */
+        if (event == BT_EVT_HARDWARE_INIT_FAIL)
+        {
+            BTIF_TRACE_DEBUG0("btif_task: hardware init failed");
+            bte_main_disable();
+            btif_queue_release();
+            GKI_task_self_cleanup(BTIF_TASK);
+            bte_main_shutdown();
+            btif_dut_mode = 0;
+            btif_core_state = BTIF_CORE_STATE_DISABLED;
+            HAL_CBACK(bt_hal_cbacks,adapter_state_changed_cb,BT_STATE_OFF);
+            break;
         }
 
         if (event & EVENT_MASK(GKI_SHUTDOWN_EVT))
@@ -513,7 +534,7 @@ bt_status_t btif_enable_bluetooth(void)
     btif_core_state = BTIF_CORE_STATE_ENABLING;
 
     /* Create the GKI tasks and run them */
-    bte_main_enable(btif_local_bd_addr.address);
+    bte_main_enable();
 
     return BT_STATUS_SUCCESS;
 }
@@ -648,7 +669,9 @@ bt_status_t btif_disable_bluetooth(void)
     btif_sock_cleanup();
 
     btif_pan_cleanup();
-
+#if (defined(BTC_INCLUDED) && BTC_INCLUDED == TRUE)
+    btc_deinit();
+#endif /*BTC*/
     status = BTA_DisableBluetooth();
 
     btif_config_flush();
@@ -727,6 +750,16 @@ bt_status_t btif_shutdown_bluetooth(void)
     }
 
     btif_shutdown_pending = 0;
+
+    if (btif_core_state == BTIF_CORE_STATE_ENABLING)
+    {
+        // Java layer abort BT ENABLING, could be due to ENABLE TIMEOUT
+        // Direct call from cleanup()@bluetooth.c
+        // bring down HCI/Vendor lib
+        bte_main_disable();
+        btif_core_state = BTIF_CORE_STATE_DISABLED;
+        HAL_CBACK(bt_hal_cbacks, adapter_state_changed_cb, BT_STATE_OFF);
+    }
 
     GKI_destroy_task(BTIF_TASK);
     btif_queue_release();
@@ -830,6 +863,7 @@ bt_status_t btif_dut_mode_send(uint16_t opcode, uint8_t *buf, uint8_t len)
     BTM_VendorSpecificCommand(opcode, len, buf, btif_dut_mode_cback);
     return BT_STATUS_SUCCESS;
 }
+
 /*****************************************************************************
 **
 **   btif api adapter property functions
@@ -897,7 +931,7 @@ static bt_status_t btif_in_get_remote_device_properties(bt_bdaddr_t *bd_addr)
     uint32_t num_props = 0;
 
     bt_bdname_t name, alias;
-    uint32_t cod, devtype;
+    uint32_t cod, devtype, trustval;
     bt_uuid_t remote_uuids[BT_MAX_NUM_UUIDS];
 
     memset(remote_properties, 0, sizeof(remote_properties));
@@ -909,6 +943,12 @@ static bt_status_t btif_in_get_remote_device_properties(bt_bdaddr_t *bd_addr)
 
     BTIF_STORAGE_FILL_PROPERTY(&remote_properties[num_props], BT_PROPERTY_REMOTE_FRIENDLY_NAME,
                                sizeof(alias), &alias);
+    btif_storage_get_remote_device_property(bd_addr,
+                                            &remote_properties[num_props]);
+    num_props++;
+
+    BTIF_STORAGE_FILL_PROPERTY(&remote_properties[num_props], BT_PROPERTY_REMOTE_TRUST_VALUE,
+                               sizeof(trustval), &trustval);
     btif_storage_get_remote_device_property(bd_addr,
                                             &remote_properties[num_props]);
     num_props++;

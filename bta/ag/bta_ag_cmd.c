@@ -37,7 +37,7 @@
 *****************************************************************************/
 
 /* ring timeout */
-#define BTA_AG_RING_TOUT        10000
+#define BTA_AG_RING_TOUT        3000
 
 #define BTA_AG_CMD_MAX_VAL      32767  /* Maximum value is signed 16-bit value */
 
@@ -1246,6 +1246,7 @@ void bta_ag_at_hfp_cback(tBTA_AG_SCB *p_scb, UINT16 cmd, UINT8 arg_type,
 #endif
 
         default:
+            bta_ag_send_error(p_scb, BTA_AG_ERR_OP_NOT_SUPPORTED);
             break;
     }
 
